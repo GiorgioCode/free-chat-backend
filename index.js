@@ -68,30 +68,24 @@ function getRecentMessages() {
 }
 
 // Inicializamos Socket.io con configuración optimizada para Vercel.
+// IMPORTANTE: Vercel NO soporta WebSockets persistentes en funciones serverless.
+// Por eso usamos SOLO 'polling' (HTTP long-polling) como transporte.
 const io = new Server(server, {
     // Configuramos CORS específicamente para Socket.io.
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
     },
-    // Configuración de transporte: intentar WebSocket primero, luego polling como fallback.
-    // Esto es importante para Vercel que puede tener limitaciones con WebSockets.
-    transports: ['websocket', 'polling'],
+    // CRÍTICO: Solo usar 'polling' porque Vercel no soporta WebSockets.
+    // HTTP long-polling funciona perfectamente en Vercel.
+    transports: ['polling'],
+
+    // Deshabilitamos upgrades a WebSocket ya que no están soportados.
+    allowUpgrades: false,
 
     // Configuraciones de timeout para mantener la conexión estable.
-    // pingTimeout: tiempo máximo sin respuesta antes de considerar la conexión muerta.
     pingTimeout: 60000, // 60 segundos
-
-    // pingInterval: frecuencia de pings para verificar que la conexión sigue viva.
     pingInterval: 25000, // 25 segundos
-
-    // allowUpgrades: permite actualizar de polling a websocket si es posible.
-    allowUpgrades: true,
-
-    // Configuraciones de reconexión más agresivas
-    reconnection: true,
-    reconnectionDelay: 500,
-    reconnectionAttempts: 10
 });
 
 // Escuchamos el evento 'connection'.
