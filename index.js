@@ -83,6 +83,6 @@ io.on('connection', (socket) => {
 
 // Ponemos el servidor a escuchar en el puerto 3001.
 // Es importante que este puerto sea diferente al del frontend (que suele ser 5173 con Vite).
-server.listen(3001, () => {
-    console.log('SERVER RUNNING ON PORT 3001');
+server.listen(process.env.PORT || 3001, () => {
+    console.log(`SERVER RUNNING ON PORT ${process.env.PORT || 3001}`);
 });
