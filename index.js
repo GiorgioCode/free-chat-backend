@@ -24,65 +24,145 @@ app.use(cors());
 // Socket.io necesita un servidor HTTP nativo para "montarse" sobre él.
 const server = http.createServer(app);
 
-// Inicializamos Socket.io pasándole nuestro servidor HTTP.
-// Aquí es donde ocurre la magia de la conexión en tiempo real.
+// ===== BUFFER DE MENSAJES EN MEMORIA =====
+// Almacenamos los últimos 50 mensajes en memoria para sincronización.
+// NOTA: Estos se perderán si Vercel reinicia la función serverless.
+const messageBuffer = [];
+const MAX_BUFFER_SIZE = 50;
+const MESSAGE_RETENTION_MS = 60 * 60 * 1000; // 1 hora
+
+// Función para agregar un mensaje al buffer
+function addToBuffer(message) {
+    // Agregamos timestamp al mensaje
+    const messageWithTimestamp = {
+        ...message,
+        timestamp: Date.now()
+    };
+
+    messageBuffer.push(messageWithTimestamp);
+
+    // Mantenemos solo los últimos MAX_BUFFER_SIZE mensajes
+    if (messageBuffer.length > MAX_BUFFER_SIZE) {
+        messageBuffer.shift(); // Elimina el primero (más antiguo)
+    }
+
+    // Limpiamos mensajes antiguos (más de 1 hora)
+    cleanOldMessages();
+}
+
+// Función para limpiar mensajes antiguos del buffer
+function cleanOldMessages() {
+    const now = Date.now();
+    const validMessages = messageBuffer.filter(
+        msg => (now - msg.timestamp) < MESSAGE_RETENTION_MS
+    );
+    messageBuffer.length = 0;
+    messageBuffer.push(...validMessages);
+}
+
+// Función para obtener mensajes recientes (últimos 10 minutos)
+function getRecentMessages() {
+    const now = Date.now();
+    const tenMinutesAgo = now - (10 * 60 * 1000);
+    return messageBuffer.filter(msg => msg.timestamp > tenMinutesAgo);
+}
+
+// Inicializamos Socket.io con configuración optimizada para Vercel.
 const io = new Server(server, {
     // Configuramos CORS específicamente para Socket.io.
     cors: {
-        // 'origin: "*"' significa que permitimos conexiones desde CUALQUIER dirección web.
-        // En producción, deberías poner aquí la URL específica de tu frontend (ej: "http://localhost:5173") por seguridad.
         origin: "*",
-        // Permitimos los métodos HTTP básicos GET y POST para el handshake inicial de Socket.io.
         methods: ["GET", "POST"]
-    }
+    },
+    // Configuración de transporte: intentar WebSocket primero, luego polling como fallback.
+    // Esto es importante para Vercel que puede tener limitaciones con WebSockets.
+    transports: ['websocket', 'polling'],
+
+    // Configuraciones de timeout para mantener la conexión estable.
+    // pingTimeout: tiempo máximo sin respuesta antes de considerar la conexión muerta.
+    pingTimeout: 60000, // 60 segundos
+
+    // pingInterval: frecuencia de pings para verificar que la conexión sigue viva.
+    pingInterval: 25000, // 25 segundos
+
+    // allowUpgrades: permite actualizar de polling a websocket si es posible.
+    allowUpgrades: true,
+
+    // Configuraciones de reconexión más agresivas
+    reconnection: true,
+    reconnectionDelay: 500,
+    reconnectionAttempts: 10
 });
 
 // Escuchamos el evento 'connection'.
 // Este evento se dispara CADA VEZ que un nuevo cliente (usuario) se conecta al servidor.
-// 'socket' es un objeto que representa la conexión única con ESE usuario específico.
 io.on('connection', (socket) => {
-    // Imprimimos en la consola del servidor el ID único de la conexión.
-    // Cada vez que refrescas la página, obtienes un nuevo ID.
     console.log(`User Connected: ${socket.id}`);
 
-    // 'io.emit' envía un mensaje a TODOS los clientes conectados, incluyendo al que acaba de entrar.
-    // Aquí enviamos el evento 'user_count' con el número total de clientes conectados actualmente.
-    // 'io.engine.clientsCount' es una propiedad interna que nos da ese número.
+    // Enviamos el conteo de usuarios conectados a todos.
     io.emit('user_count', io.engine.clientsCount);
 
+    // ===== SINCRONIZACIÓN DE MENSAJES RECIENTES =====
+    // Cuando un usuario se conecta, le enviamos los mensajes recientes.
+    // Esto ayuda a que no se pierdan mensajes si hubo una desconexión temporal.
+    const recentMessages = getRecentMessages();
+    if (recentMessages.length > 0) {
+        socket.emit('sync_messages', recentMessages);
+        console.log(`Synced ${recentMessages.length} recent messages to ${socket.id}`);
+    }
+
     // Escuchamos un evento personalizado llamado 'join_room'.
-    // Esto permite agrupar usuarios en "salas" separadas (como canales de chat).
     socket.on('join_room', (room) => {
-        // El método 'join' mete a este socket específico en la sala indicada.
         socket.join(room);
         console.log(`User with ID: ${socket.id} joined room: ${room}`);
     });
 
-    // Escuchamos el evento 'send_message' que viene del frontend.
-    // 'data' es la información que nos envía el usuario (el texto del mensaje, su ID, etc.).
-    socket.on('send_message', (data) => {
+    // ===== MANEJO DE MENSAJES CON ACKNOWLEDGMENT =====
+    // Escuchamos el evento 'send_message' con callback para confirmación.
+    // El tercer parámetro 'callback' es una función que se puede invocar para enviar
+    // una confirmación (ACK) de vuelta al cliente que envió el mensaje.
+    socket.on('send_message', (data, callback) => {
         console.log("Message Received:", data);
 
-        // Cuando recibimos un mensaje, queremos reenviarlo a TODOS los demás para que lo vean.
-        // Usamos 'io.emit' para transmitir el evento 'receive_message' con los mismos datos a todo el mundo.
-        // Si usáramos 'socket.emit', solo le responderíamos al usuario que envió el mensaje.
-        // Si usáramos 'socket.broadcast.emit', se lo enviaríamos a todos MENOS al que lo envió.
-        io.emit('receive_message', data);
+        try {
+            // Agregamos el mensaje al buffer en memoria
+            addToBuffer(data);
+
+            // Transmitimos el mensaje a TODOS los clientes conectados
+            io.emit('receive_message', data);
+
+            // Enviamos confirmación (ACK) al remitente
+            // Esto le indica que el mensaje fue recibido y procesado exitosamente
+            if (callback && typeof callback === 'function') {
+                callback({
+                    success: true,
+                    messageId: data.id,
+                    timestamp: Date.now()
+                });
+            }
+        } catch (error) {
+            console.error('Error processing message:', error);
+
+            // Si hay error, notificamos al remitente
+            if (callback && typeof callback === 'function') {
+                callback({
+                    success: false,
+                    error: 'Failed to process message'
+                });
+            }
+        }
     });
 
     // Escuchamos el evento 'disconnect'.
-    // Se dispara cuando un usuario cierra la pestaña o pierde la conexión.
     socket.on('disconnect', () => {
         console.log('User Disconnected', socket.id);
 
-        // Como alguien se fue, el contador de usuarios ha cambiado.
-        // Volvemos a emitir el conteo actualizado a todos los que quedan conectados.
+        // Actualizamos el conteo de usuarios
         io.emit('user_count', io.engine.clientsCount);
     });
 });
 
-// Ponemos el servidor a escuchar en el puerto 3001.
-// Es importante que este puerto sea diferente al del frontend (que suele ser 5173 con Vite).
+// Ponemos el servidor a escuchar en el puerto especificado por Vercel o 3001 localmente.
 server.listen(process.env.PORT || 3001, () => {
     console.log(`SERVER RUNNING ON PORT ${process.env.PORT || 3001}`);
 });
